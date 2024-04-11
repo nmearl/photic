@@ -23,27 +23,39 @@
         :alt: Twitter
         :target: https://twitter.com/nps-tdes
 
-.. image:: https://img.shields.io/badge/-PyScaffold-005CA0?logo=pyscaffold
-    :alt: Project generated with PyScaffold
-    :target: https://pyscaffold.org/
-
 |
 
 ========
-nps-tdes
+Neural Proceses for Tidal Disruption Events
 ========
 
+This is a project to develop a neural process model for the classification and prediction 
+of tidal disruption events from identified transients. This project will address the 
+specific needs of TDEs in order to confidently disambiguate them from imposter phenomena 
+(i.e. active galactic nuclei, supernovae, etc) that are much better represented in 
+current classification software. 
 
-    Add a short description here!
+Current neural network classification systems are limited by the lack of a unifying 
+physical model for the expected behavior of TDEs and are unable to adapt to new 
+observations once a network has been trained. NPs use a neural network to parameterize 
+and learn a map from the observed data to posterior predictive distributions. Like GPs, 
+this will allow for rapid adaptation to new data while providing uncertainty estimation 
+using the nature of probabilistic inference. Unlike GPs, however, it will not require 
+strictly establishing priors, which are instead learned from the data.
 
+Goals
+-----
 
-A longer description of your project goes here...
+- Create a model for predicting light curve behavior given progressively 
+  increasing context points.
+- Use this predicted light curve to classify the transient, giving a confidence with
+  which the object may be considered a TDE.
+- Comparatively evaluate the efficacy of the model on simulated and real data, and
+  anticipate its usefulness in the era of the Vera Rubin Observatory (LSST).
 
+Useful Links
+------------
 
-.. _pyscaffold-notes:
+- [PLAsTiCC Data](https://zenodo.org/records/2539456): archive of simulated light curve
+  data for multiple bands, meant to mimic the output photometry of LSST.
 
-Note
-====
-
-This project has been set up using PyScaffold 4.5. For details and usage
-information on PyScaffold see https://pyscaffold.org/.
