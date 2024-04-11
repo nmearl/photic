@@ -25,8 +25,8 @@
 
 |
 
-Neural Proceses for Tidal Disruption Events
-===========================================
+Neural Processes for Tidal Disruption Events
+============================================
 
 This is a project to develop a neural process model for the classification and prediction 
 of tidal disruption events from identified transients. This project will address the 
