@@ -1,0 +1,48 @@
+{
+    "os": "macOS-14.4.1-arm64-arm-64bit",
+    "python": "3.12.3",
+    "heartbeatAt": "2024-05-02T15:40:21.215368",
+    "startedAt": "2024-05-02T15:40:20.673760",
+    "docker": null,
+    "cuda": null,
+    "args": [],
+    "state": "running",
+    "program": "/Users/nmearl/miniforge3/envs/photic-dev/bin/photic",
+    "codePathLocal": null,
+    "git": {
+        "remote": null,
+        "commit": "2c1455b3f289322bc79d3638efcc411887eea0fc"
+    },
+    "email": "contact@nicholasearl.me",
+    "root": "/Users/nmearl/projects/photic",
+    "host": "aluminum.local",
+    "username": "nmearl",
+    "executable": "/Users/nmearl/miniforge3/envs/photic-dev/bin/python3.12",
+    "cpu_count": 10,
+    "cpu_count_logical": 10,
+    "cpu_freq": {
+        "current": 3228,
+        "min": 600,
+        "max": 3228
+    },
+    "cpu_freq_per_core": [
+        {
+            "current": 3228,
+            "min": 600,
+            "max": 3228
+        }
+    ],
+    "disk": {
+        "/": {
+            "total": 926.3517189025879,
+            "used": 627.1145477294922
+        }
+    },
+    "gpuapple": {
+        "type": "arm",
+        "vendor": "Apple"
+    },
+    "memory": {
+        "total": 16.0
+    }
+}

@@ -1,5 +1,5 @@
 """
-    Setup file for nps-tdes.
+    Setup file for photic.
     Use setup.cfg to configure your project.
 
     This file was generated with PyScaffold 4.5.

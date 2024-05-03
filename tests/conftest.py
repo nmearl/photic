@@ -1,5 +1,5 @@
 """
-    Dummy conftest.py for nps_tdes.
+    Dummy conftest.py for photic.
 
     If you don't know what this is for, just leave it empty.
     Read more about conftest.py under:

@@ -1,8 +1,8 @@
-========
-nps-tdes
-========
+======
+photic
+======
 
-This is the documentation of **nps-tdes**.
+This is the documentation of **photic**.
 
 .. note::
 

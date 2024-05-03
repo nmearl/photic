@@ -1,6 +1,6 @@
 import pytest
 
-from nps_tdes.skeleton import fib, main
+from photic.skeleton import fib, main
 
 __author__ = "Nicholas Earl"
 __copyright__ = "Nicholas Earl"
