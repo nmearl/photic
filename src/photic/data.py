@@ -269,6 +269,15 @@ class MallornCollateConfig:
     epoch: int = 0
 
 
+@dataclass(slots=True)
+class MallornCollate:
+    training: bool
+    cfg: MallornCollateConfig
+
+    def __call__(self, batch: List[dict]) -> NPBatch:
+        return build_mallorn_batch(batch, training=self.training, cfg=self.cfg)
+
+
 def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateConfig) -> NPBatch:
     context_x, context_y, context_yerr, context_band, context_mask = [], [], [], [], []
     target_x, target_y, target_yerr, target_band, target_mask = [], [], [], [], []
@@ -391,9 +400,7 @@ def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateCo
 
 
 def make_mallorn_collate(training: bool, cfg: MallornCollateConfig) -> Callable[[List[dict]], NPBatch]:
-    def collate(batch: List[dict]) -> NPBatch:
-        return build_mallorn_batch(batch, training=training, cfg=cfg)
-    return collate
+    return MallornCollate(training=training, cfg=cfg)
 
 
 def prepare_mallorn_datasets(
