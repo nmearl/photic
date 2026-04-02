@@ -257,10 +257,16 @@ def _split_band(t_b, f_b, fe_b, snr_b, n_ctx: int, rng: np.random.Generator, blo
 @dataclass(slots=True)
 class MallornCollateConfig:
     seed: int = 42
+    context_strategy: str = "prefix"
     mask_prob: float = 0.50
     block_mask_prob: float = 0.50
     block_mask_frac: float = 0.35
     min_ctx_per_band: int = 2
+    min_ctx_points_total: int = 3
+    min_target_points_total: int = 1
+    prefix_context_frac_min: float = 0.15
+    prefix_context_frac_max: float = 0.60
+    prefix_val_fracs: tuple[float, ...] = (0.15, 0.25, 0.40, 0.60)
     deterministic_val_fraction: float = 0.50
     z_min: float = 0.0
     z_max: float = 1.0
@@ -278,73 +284,136 @@ class MallornCollate:
         return build_mallorn_batch(batch, training=self.training, cfg=self.cfg)
 
 
+def _split_prefix_indices(n: int, training: bool, cfg: MallornCollateConfig, item: dict, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    if n == 0:
+        empty = np.array([], dtype=np.int64)
+        return empty, empty
+    min_ctx = min(cfg.min_ctx_points_total, max(n - cfg.min_target_points_total, 1))
+    max_ctx = max(min_ctx, n - cfg.min_target_points_total)
+    if training:
+        frac = float(rng.uniform(cfg.prefix_context_frac_min, cfg.prefix_context_frac_max))
+    else:
+        frac_choices = cfg.prefix_val_fracs if cfg.prefix_val_fracs else (cfg.deterministic_val_fraction,)
+        choice_idx = int(det_rng(cfg.seed, item["oid"], "prefix_val_frac").integers(0, len(frac_choices)))
+        frac = float(frac_choices[choice_idx])
+    n_ctx = int(round(frac * n))
+    n_ctx = max(min_ctx, min(n_ctx, max_ctx))
+    ctx_idx = np.arange(n_ctx, dtype=np.int64)
+    tgt_idx = np.arange(n_ctx, n, dtype=np.int64)
+    if len(tgt_idx) == 0:
+        split = max(1, n - cfg.min_target_points_total)
+        ctx_idx = np.arange(split, dtype=np.int64)
+        tgt_idx = np.arange(split, n, dtype=np.int64)
+    return ctx_idx, tgt_idx
+
+
+def _build_prefix_item(item: dict, training: bool, cfg: MallornCollateConfig) -> dict[str, np.ndarray]:
+    n = len(item["t_norm"])
+    worker_info = torch.utils.data.get_worker_info()
+    worker_id = 0 if worker_info is None else worker_info.id
+    rng = train_rng(cfg.seed, item["oid"], 0, cfg.epoch, worker_id) if training else det_rng(cfg.seed, item["oid"], "prefix")
+    ctx_idx, tgt_idx = _split_prefix_indices(n, training=training, cfg=cfg, item=item, rng=rng)
+    return {
+        "context_x": item["t_norm"][ctx_idx],
+        "context_y": item["flux_norm"][ctx_idx],
+        "context_yerr": item["ferr_norm"][ctx_idx],
+        "context_band": item["band_idx"][ctx_idx],
+        "target_x": item["t_norm"][tgt_idx],
+        "target_y": item["flux_norm"][tgt_idx],
+        "target_yerr": item["ferr_norm"][tgt_idx],
+        "target_band": item["band_idx"][tgt_idx],
+        "target_snr": item["obs_snr"][tgt_idx],
+        "context_raw_span_days": float(item["t_raw"][ctx_idx][-1] - item["t_raw"][ctx_idx][0]) if len(ctx_idx) >= 2 else 0.0,
+        "context_n_points": int(len(ctx_idx)),
+        "context_n_bands": int(len(np.unique(item["band_idx"][ctx_idx]))) if len(ctx_idx) > 0 else 0,
+    }
+
+
 def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateConfig) -> NPBatch:
     context_x, context_y, context_yerr, context_band, context_mask = [], [], [], [], []
     target_x, target_y, target_yerr, target_band, target_mask = [], [], [], [], []
     labels, redshifts = [], []
     morph_targets = []
-    metadata = {"oid": [], "obs_snr": [], "target_is_peak": [], "morph_names": MORPH_NAMES}
+    metadata = {"oid": [], "obs_snr": [], "target_is_peak": [], "morph_names": MORPH_NAMES, "context_n_points": [], "context_span_days": [], "context_n_bands": []}
 
     for item in items:
-        ctx_t_parts, ctx_f_parts, ctx_fe_parts, ctx_b_parts = [], [], [], []
-        tgt_t_parts, tgt_f_parts, tgt_fe_parts, tgt_b_parts = [], [], [], []
-        tgt_snr_parts = []
+        if cfg.context_strategy == "prefix":
+            split = _build_prefix_item(item, training=training, cfg=cfg)
+            cx = split["context_x"]
+            cy = split["context_y"]
+            ce = split["context_yerr"]
+            cb = split["context_band"]
+            tx = split["target_x"]
+            ty = split["target_y"]
+            te = split["target_yerr"]
+            ts = split["target_snr"]
+            tb = split["target_band"]
+            context_n_points = split["context_n_points"]
+            context_span_days = split["context_raw_span_days"]
+            context_n_bands = split["context_n_bands"]
+        else:
+            ctx_t_parts, ctx_f_parts, ctx_fe_parts, ctx_b_parts = [], [], [], []
+            tgt_t_parts, tgt_f_parts, tgt_fe_parts, tgt_b_parts = [], [], [], []
+            tgt_snr_parts = []
 
-        for bi in range(len(BANDS)):
-            bm = item["band_idx"] == bi
-            t_b = item["t_norm"][bm]
-            f_b = item["flux_norm"][bm]
-            fe_b = item["ferr_norm"][bm]
-            snr_b = item["obs_snr"][bm]
-            n = len(t_b)
-            if training:
-                worker_info = torch.utils.data.get_worker_info()
-                worker_id = 0 if worker_info is None else worker_info.id
-                rng = train_rng(cfg.seed, item["oid"], bi, cfg.epoch, worker_id)
-                n_ctx = max(cfg.min_ctx_per_band, int(round((1.0 - cfg.mask_prob) * n)))
-                use_block = rng.random() < cfg.block_mask_prob
+            for bi in range(len(BANDS)):
+                bm = item["band_idx"] == bi
+                t_b = item["t_norm"][bm]
+                f_b = item["flux_norm"][bm]
+                fe_b = item["ferr_norm"][bm]
+                snr_b = item["obs_snr"][bm]
+                n = len(t_b)
+                if training:
+                    worker_info = torch.utils.data.get_worker_info()
+                    worker_id = 0 if worker_info is None else worker_info.id
+                    rng = train_rng(cfg.seed, item["oid"], bi, cfg.epoch, worker_id)
+                    n_ctx = max(cfg.min_ctx_per_band, int(round((1.0 - cfg.mask_prob) * n)))
+                    use_block = rng.random() < cfg.block_mask_prob
+                else:
+                    rng = det_rng(cfg.seed, item["oid"], f"val_b{bi}")
+                    n_ctx = max(cfg.min_ctx_per_band, int(round(cfg.deterministic_val_fraction * n)))
+                    use_block = False
+                t_ctx, f_ctx, t_tgt, f_tgt, fe_tgt, snr_tgt, ctx_idx, tgt_idx = _split_band(
+                    t_b, f_b, fe_b, snr_b, n_ctx, rng,
+                    block_mask=use_block, block_frac=cfg.block_mask_frac, min_ctx=cfg.min_ctx_per_band,
+                )
+                if len(t_ctx) > 0:
+                    ctx_t_parts.append(t_ctx)
+                    ctx_f_parts.append(f_ctx)
+                    ctx_fe_parts.append(fe_b[ctx_idx])
+                    ctx_b_parts.append(np.full(len(t_ctx), bi, dtype=np.int64))
+                if len(t_tgt) > 0:
+                    tgt_t_parts.append(t_tgt)
+                    tgt_f_parts.append(f_tgt)
+                    tgt_fe_parts.append(fe_tgt)
+                    tgt_snr_parts.append(snr_tgt)
+                    tgt_b_parts.append(np.full(len(t_tgt), bi, dtype=np.int64))
+
+            if ctx_t_parts:
+                cx = np.concatenate(ctx_t_parts)
+                cy = np.concatenate(ctx_f_parts)
+                ce = np.concatenate(ctx_fe_parts)
+                cb = np.concatenate(ctx_b_parts)
+                order = np.argsort(cx)
+                cx, cy, ce, cb = cx[order], cy[order], ce[order], cb[order]
             else:
-                rng = det_rng(cfg.seed, item["oid"], f"val_b{bi}")
-                n_ctx = max(cfg.min_ctx_per_band, int(round(cfg.deterministic_val_fraction * n)))
-                use_block = False
-            t_ctx, f_ctx, t_tgt, f_tgt, fe_tgt, snr_tgt, ctx_idx, tgt_idx = _split_band(
-                t_b, f_b, fe_b, snr_b, n_ctx, rng,
-                block_mask=use_block, block_frac=cfg.block_mask_frac, min_ctx=cfg.min_ctx_per_band,
-            )
-            if len(t_ctx) > 0:
-                ctx_t_parts.append(t_ctx)
-                ctx_f_parts.append(f_ctx)
-                ctx_fe_parts.append(fe_b[ctx_idx])
-                ctx_b_parts.append(np.full(len(t_ctx), bi, dtype=np.int64))
-            if len(t_tgt) > 0:
-                tgt_t_parts.append(t_tgt)
-                tgt_f_parts.append(f_tgt)
-                tgt_fe_parts.append(fe_tgt)
-                tgt_snr_parts.append(snr_tgt)
-                tgt_b_parts.append(np.full(len(t_tgt), bi, dtype=np.int64))
+                cx = cy = ce = np.array([], dtype=np.float32)
+                cb = np.array([], dtype=np.int64)
 
-        if ctx_t_parts:
-            cx = np.concatenate(ctx_t_parts)
-            cy = np.concatenate(ctx_f_parts)
-            ce = np.concatenate(ctx_fe_parts)
-            cb = np.concatenate(ctx_b_parts)
-            order = np.argsort(cx)
-            cx, cy, ce, cb = cx[order], cy[order], ce[order], cb[order]
-        else:
-            cx = cy = ce = np.array([], dtype=np.float32)
-            cb = np.array([], dtype=np.int64)
-
-        if tgt_t_parts:
-            tx = np.concatenate(tgt_t_parts)
-            ty = np.concatenate(tgt_f_parts)
-            te = np.concatenate(tgt_fe_parts)
-            ts = np.concatenate(tgt_snr_parts)
-            tb = np.concatenate(tgt_b_parts)
-            order = np.argsort(tx)
-            tx, ty, te, ts, tb = tx[order], ty[order], te[order], ts[order], tb[order]
-        else:
-            tx = ty = te = ts = np.array([], dtype=np.float32)
-            tb = np.array([], dtype=np.int64)
+            if tgt_t_parts:
+                tx = np.concatenate(tgt_t_parts)
+                ty = np.concatenate(tgt_f_parts)
+                te = np.concatenate(tgt_fe_parts)
+                ts = np.concatenate(tgt_snr_parts)
+                tb = np.concatenate(tgt_b_parts)
+                order = np.argsort(tx)
+                tx, ty, te, ts, tb = tx[order], ty[order], te[order], ts[order], tb[order]
+            else:
+                tx = ty = te = ts = np.array([], dtype=np.float32)
+                tb = np.array([], dtype=np.int64)
+            context_n_points = int(len(cx))
+            context_span_days = float(item["t_raw"][np.argsort(item["t_norm"])[:len(cx)]][-1] - item["t_raw"][np.argsort(item["t_norm"])[:len(cx)]][0]) if len(cx) >= 2 else 0.0
+            context_n_bands = int(len(np.unique(cb))) if len(cb) > 0 else 0
 
         context_x.append(torch.as_tensor(cx, dtype=torch.float32))
         context_y.append(torch.as_tensor(cy, dtype=torch.float32))
@@ -365,6 +434,9 @@ def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateCo
         metadata["oid"].append(item["oid"])
         metadata["obs_snr"].append(torch.as_tensor(ts, dtype=torch.float32))
         metadata["target_is_peak"].append(torch.as_tensor((ts > 5.0).astype(np.float32), dtype=torch.float32))
+        metadata["context_n_points"].append(float(context_n_points))
+        metadata["context_span_days"].append(float(context_span_days))
+        metadata["context_n_bands"].append(float(context_n_bands))
 
     def _pad(vals: List[torch.Tensor], pad_value: float = 0.0, dtype=None):
         max_len = max((len(v) for v in vals), default=1)
@@ -394,6 +466,9 @@ def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateCo
             "obs_snr": _pad(metadata["obs_snr"]),
             "target_is_peak": _pad(metadata["target_is_peak"]),
             "morph_names": metadata["morph_names"],
+            "context_n_points": torch.as_tensor(metadata["context_n_points"], dtype=torch.float32),
+            "context_span_days": torch.as_tensor(metadata["context_span_days"], dtype=torch.float32),
+            "context_n_bands": torch.as_tensor(metadata["context_n_bands"], dtype=torch.float32),
         },
     )
     return batch
