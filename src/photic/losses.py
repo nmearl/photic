@@ -17,6 +17,7 @@ class JointLosses:
     total: torch.Tensor
     recon: torch.Tensor
     cls: torch.Tensor
+    interesting: torch.Tensor
     morph: torch.Tensor
     kl: torch.Tensor
 
@@ -91,10 +92,20 @@ def morphology_loss(pred: torch.Tensor | None, targets: torch.Tensor | None) -> 
     return F.smooth_l1_loss(pred, targets)
 
 
+def interestingness_loss(logits: torch.Tensor | None, labels: torch.Tensor | None, cfg: JointLossConfig) -> torch.Tensor:
+    if logits is None or labels is None:
+        return torch.tensor(0.0, device=logits.device if logits is not None else labels.device if labels is not None else "cpu")
+    pos_weight = None
+    if cfg.interesting_pos_weight is not None:
+        pos_weight = torch.tensor([cfg.interesting_pos_weight], device=logits.device, dtype=logits.dtype)
+    return F.binary_cross_entropy_with_logits(logits, labels, pos_weight=pos_weight)
+
+
 def joint_loss(out: JointModelOutput, batch: NPBatch, cfg: JointLossConfig) -> JointLosses:
     recon = gaussian_reconstruction_nll(out, batch, cfg)
     cls = binary_classification_loss(out.class_logits, batch.labels, cfg)
+    interesting = interestingness_loss(out.interesting_logits, batch.interesting_labels, cfg)
     morph = morphology_loss(out.morph_pred, batch.morph_targets)
     kl = latent_kl_standard_normal(out.latent_mu, out.latent_logvar).to(recon.device)
-    total = cfg.lambda_recon * recon + cfg.lambda_cls * cls + cfg.lambda_morph * morph + cfg.beta_kl * kl
-    return JointLosses(total=total, recon=recon, cls=cls, morph=morph, kl=kl)
+    total = cfg.lambda_recon * recon + cfg.lambda_cls * cls + cfg.lambda_interesting * interesting + cfg.lambda_morph * morph + cfg.beta_kl * kl
+    return JointLosses(total=total, recon=recon, cls=cls, interesting=interesting, morph=morph, kl=kl)

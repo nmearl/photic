@@ -135,9 +135,31 @@ def valid_object_ids(lc: pd.DataFrame, min_obs: int = 3) -> List[str]:
     return counts[counts >= min_obs].index.tolist()
 
 
+def compute_flux_norm_stats(lc: pd.DataFrame, object_ids: List[str] | None = None) -> Tuple[np.ndarray, np.ndarray]:
+    if object_ids is not None:
+        lc = lc[lc["object_id"].isin(object_ids)]
+    centers = np.zeros(len(BANDS), dtype=np.float32)
+    scales = np.ones(len(BANDS), dtype=np.float32)
+    for bi, band in enumerate(BANDS):
+        vals = lc.loc[lc["band"] == band, "flux"].dropna().values.astype(np.float32)
+        if len(vals) == 0:
+            continue
+        center = float(np.median(vals))
+        mad = float(np.median(np.abs(vals - center)))
+        scale = 1.4826 * mad
+        if not np.isfinite(scale) or scale < 1e-6:
+            q25, q75 = np.quantile(vals, [0.25, 0.75])
+            scale = float((q75 - q25) / 1.349) if (q75 - q25) > 1e-6 else float(np.std(vals))
+        if not np.isfinite(scale) or scale < 1e-6:
+            scale = 1.0
+        centers[bi] = center
+        scales[bi] = scale
+    return centers, scales
+
+
 class MallornDataset(Dataset):
-    def __init__(self, object_ids: List[str], lc: pd.DataFrame, log: pd.DataFrame):
-        target_map = dict(zip(log["object_id"], log["target"]))
+    def __init__(self, object_ids: List[str], lc: pd.DataFrame, log: pd.DataFrame, flux_center_by_band: np.ndarray | None = None, flux_scale_by_band: np.ndarray | None = None):
+        target_map = dict(zip(log["object_id"], log["target"])) if "target" in log.columns else {}
         z_map = dict(zip(
             log["object_id"],
             log["Z"].fillna(np.nan).astype(float) if "Z" in log.columns else [np.nan] * len(log),
@@ -147,6 +169,8 @@ class MallornDataset(Dataset):
             for oid in object_ids
         }
         self.data: Dict[str, dict] = {}
+        self.flux_center_by_band = np.zeros(len(BANDS), dtype=np.float32) if flux_center_by_band is None else np.asarray(flux_center_by_band, dtype=np.float32)
+        self.flux_scale_by_band = np.ones(len(BANDS), dtype=np.float32) if flux_scale_by_band is None else np.asarray(flux_scale_by_band, dtype=np.float32)
         lc_grp = lc.groupby("object_id")
         for oid in object_ids:
             if oid not in lc_grp.groups:
@@ -159,23 +183,24 @@ class MallornDataset(Dataset):
             t_min = t_raw.min()
             t_span = max(float(t_raw.max() - t_raw.min()), 1.0)
             t_norm = (t_raw - t_min) / t_span
-            fmean = float(flux_raw.mean())
-            fstd = max(float(flux_raw.std()), 1e-6)
-            fn = (flux_raw - fmean) / fstd
-            fen = ferr_raw / fstd
+            band_centers = self.flux_center_by_band[band_idx]
+            band_scales = self.flux_scale_by_band[band_idx]
+            fn = (flux_raw - band_centers) / band_scales
+            fen = ferr_raw / band_scales
             obs_snr = (np.abs(flux_raw) / (ferr_raw + 1e-6)).astype(np.float32)
             if len(t_norm) < 3:
                 continue
             morph_raw = _compute_morphology_targets(t_norm, fn, obs_snr, band_idx)
             self.data[oid] = dict(
                 t_norm=t_norm,
+                flux_raw=flux_raw,
                 flux_norm=fn,
                 ferr_norm=fen,
                 obs_snr=obs_snr,
                 band_idx=band_idx,
                 t_raw=t_raw,
-                flux_mean=fmean,
-                flux_std=fstd,
+                flux_center_by_band=self.flux_center_by_band.copy(),
+                flux_scale_by_band=self.flux_scale_by_band.copy(),
                 t_span=t_span,
                 t_min=t_min,
                 target=int(target_map.get(oid, 0)),
@@ -264,6 +289,18 @@ class MallornCollateConfig:
     min_ctx_per_band: int = 2
     min_ctx_points_total: int = 3
     min_target_points_total: int = 1
+    interesting_snr_threshold: float = 5.0
+    interesting_cluster_min_points: int = 2
+    interesting_window_days: float = 30.0
+    prefix_anchor_snr_threshold: float = 5.0
+    prefix_anchor_cluster_min_points: int = 2
+    prefix_anchor_cluster_window_days: float = 7.0
+    prefix_anchor_require_positive_flux: bool = True
+    prefix_pre_anchor_days: float = 30.0
+    prefix_context_days_min: float = 7.0
+    prefix_context_days_max: float = 30.0
+    prefix_val_days: tuple[float, ...] = (7.0, 14.0, 30.0)
+    prefix_target_horizon_days: float = 90.0
     prefix_context_frac_min: float = 0.15
     prefix_context_frac_max: float = 0.60
     prefix_val_fracs: tuple[float, ...] = (0.15, 0.25, 0.40, 0.60)
@@ -307,32 +344,150 @@ def _split_prefix_indices(n: int, training: bool, cfg: MallornCollateConfig, ite
     return ctx_idx, tgt_idx
 
 
+def _prefix_anchor_index(item: dict, cfg: MallornCollateConfig) -> int:
+    snr = np.asarray(item["obs_snr"], dtype=np.float32)
+    flux = np.asarray(item["flux_norm"], dtype=np.float32)
+    t_raw = np.asarray(item["t_raw"], dtype=np.float32)
+    strong = np.where(snr >= cfg.prefix_anchor_snr_threshold)[0]
+    cluster_n = max(int(cfg.prefix_anchor_cluster_min_points), 1)
+    if len(strong) >= cluster_n:
+        for start in strong:
+            end_time = float(t_raw[start]) + max(cfg.prefix_anchor_cluster_window_days, 0.0)
+            cluster_mask = strong[(t_raw[strong] >= t_raw[start]) & (t_raw[strong] <= end_time)]
+            if len(cluster_mask) < cluster_n:
+                continue
+            if cfg.prefix_anchor_require_positive_flux:
+                cluster_flux = flux[cluster_mask]
+                if not (np.any(cluster_flux > 0.0) and float(np.median(cluster_flux)) > 0.0):
+                    continue
+            return int(start)
+    if len(strong) > 0:
+        return int(strong[0])
+    return 0
+
+
+def _interesting_label_from_indices(item: dict, ctx_idx: np.ndarray, cfg: MallornCollateConfig) -> float:
+    if len(ctx_idx) == 0:
+        return 0.0
+    t_raw = np.asarray(item["t_raw"], dtype=np.float32)
+    flux_raw = np.asarray(item["flux_raw"], dtype=np.float32)
+    snr = np.asarray(item["obs_snr"], dtype=np.float32)
+    start_time = float(t_raw[ctx_idx[-1]])
+    end_time = start_time + max(cfg.interesting_window_days, 0.0)
+    cand = np.where(
+        (t_raw > start_time)
+        & (t_raw <= end_time)
+        & (snr >= cfg.interesting_snr_threshold)
+        & (flux_raw > 0.0)
+    )[0]
+    need = max(int(cfg.interesting_cluster_min_points), 1)
+    if len(cand) < need:
+        return 0.0
+    for start in cand:
+        cluster = cand[(t_raw[cand] >= t_raw[start]) & (t_raw[cand] <= t_raw[start] + max(cfg.interesting_window_days, 0.0))]
+        if len(cluster) >= need:
+            return 1.0
+    return 0.0
+
+
+def _split_alert_prefix_indices(
+    item: dict,
+    training: bool,
+    cfg: MallornCollateConfig,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    anchor_idx = _prefix_anchor_index(item, cfg)
+    t_raw = np.asarray(item["t_raw"], dtype=np.float32)
+    n_total = len(t_raw)
+    if n_total == 0:
+        empty = np.array([], dtype=np.int64)
+        return empty, empty, 0
+
+    anchor_time = float(t_raw[anchor_idx])
+    pre_start_time = anchor_time - max(cfg.prefix_pre_anchor_days, 0.0)
+    window_start_idx = int(np.searchsorted(t_raw, pre_start_time, side="left"))
+    n_window = n_total - window_start_idx
+    if n_window < cfg.min_ctx_points_total + cfg.min_target_points_total:
+        window_start_idx = 0
+        n_window = n_total
+        anchor_idx = _prefix_anchor_index(item, cfg)
+        anchor_time = float(t_raw[anchor_idx])
+
+    min_ctx = min(cfg.min_ctx_points_total, max(n_window - cfg.min_target_points_total, 1))
+    max_cutoff = n_window - cfg.min_target_points_total - 1
+    if max_cutoff < 0:
+        empty = np.array([], dtype=np.int64)
+        return empty, empty, window_start_idx
+
+    if training:
+        context_days = float(rng.uniform(cfg.prefix_context_days_min, cfg.prefix_context_days_max))
+    else:
+        day_choices = tuple(d for d in cfg.prefix_val_days if d >= 0.0)
+        if day_choices:
+            choice_idx = int(det_rng(cfg.seed, item["oid"], "prefix_val_days").integers(0, len(day_choices)))
+            context_days = float(day_choices[choice_idx])
+        else:
+            context_days = -1.0
+
+    if context_days >= 0.0:
+        cutoff_time = anchor_time + context_days
+        cutoff_abs = int(np.searchsorted(t_raw, cutoff_time, side="right")) - 1
+        cutoff_rel = cutoff_abs - window_start_idx
+    else:
+        frac_ctx, _ = _split_prefix_indices(n_window, training=training, cfg=cfg, item=item, rng=rng)
+        cutoff_rel = len(frac_ctx) - 1
+
+    cutoff_rel = max(min_ctx - 1, min(cutoff_rel, max_cutoff))
+    ctx_idx = np.arange(window_start_idx, window_start_idx + cutoff_rel + 1, dtype=np.int64)
+    tgt_start = window_start_idx + cutoff_rel + 1
+    if cfg.prefix_target_horizon_days > 0.0:
+        target_end_time = float(t_raw[ctx_idx[-1]]) + cfg.prefix_target_horizon_days
+        tgt_stop = int(np.searchsorted(t_raw, target_end_time, side="right"))
+        tgt_stop = max(tgt_start + cfg.min_target_points_total, min(tgt_stop, n_total))
+    else:
+        tgt_stop = n_total
+    tgt_idx = np.arange(tgt_start, tgt_stop, dtype=np.int64)
+    if len(tgt_idx) < cfg.min_target_points_total:
+        tgt_stop = min(n_total, tgt_start + cfg.min_target_points_total)
+        tgt_idx = np.arange(tgt_start, tgt_stop, dtype=np.int64)
+    return ctx_idx, tgt_idx, window_start_idx
+
+
 def _build_prefix_item(item: dict, training: bool, cfg: MallornCollateConfig) -> dict[str, np.ndarray]:
-    n = len(item["t_norm"])
     worker_info = torch.utils.data.get_worker_info()
     worker_id = 0 if worker_info is None else worker_info.id
     rng = train_rng(cfg.seed, item["oid"], 0, cfg.epoch, worker_id) if training else det_rng(cfg.seed, item["oid"], "prefix")
-    ctx_idx, tgt_idx = _split_prefix_indices(n, training=training, cfg=cfg, item=item, rng=rng)
+    anchor_idx = _prefix_anchor_index(item, cfg)
+    ctx_idx, tgt_idx, window_start_idx = _split_alert_prefix_indices(item=item, training=training, cfg=cfg, rng=rng)
+    t_norm_all = item["t_norm"]
+    flux_norm_all = item["flux_norm"]
+    ferr_norm_all = item["ferr_norm"]
+    band_idx_all = item["band_idx"]
+    obs_snr_all = item["obs_snr"]
+    t_raw_all = item["t_raw"]
     return {
-        "context_x": item["t_norm"][ctx_idx],
-        "context_y": item["flux_norm"][ctx_idx],
-        "context_yerr": item["ferr_norm"][ctx_idx],
-        "context_band": item["band_idx"][ctx_idx],
-        "target_x": item["t_norm"][tgt_idx],
-        "target_y": item["flux_norm"][tgt_idx],
-        "target_yerr": item["ferr_norm"][tgt_idx],
-        "target_band": item["band_idx"][tgt_idx],
-        "target_snr": item["obs_snr"][tgt_idx],
-        "context_raw_span_days": float(item["t_raw"][ctx_idx][-1] - item["t_raw"][ctx_idx][0]) if len(ctx_idx) >= 2 else 0.0,
+        "context_x": t_norm_all[ctx_idx],
+        "context_y": flux_norm_all[ctx_idx],
+        "context_yerr": ferr_norm_all[ctx_idx],
+        "context_band": band_idx_all[ctx_idx],
+        "target_x": t_norm_all[tgt_idx],
+        "target_y": flux_norm_all[tgt_idx],
+        "target_yerr": ferr_norm_all[tgt_idx],
+        "target_band": band_idx_all[tgt_idx],
+        "target_snr": obs_snr_all[tgt_idx],
+        "context_raw_span_days": float(t_raw_all[ctx_idx][-1] - t_raw_all[ctx_idx][0]) if len(ctx_idx) >= 2 else 0.0,
         "context_n_points": int(len(ctx_idx)),
-        "context_n_bands": int(len(np.unique(item["band_idx"][ctx_idx]))) if len(ctx_idx) > 0 else 0,
+        "context_n_bands": int(len(np.unique(band_idx_all[ctx_idx]))) if len(ctx_idx) > 0 else 0,
+        "interesting_label": float(_interesting_label_from_indices(item, ctx_idx, cfg)),
+        "prefix_anchor_idx": int(anchor_idx),
+        "prefix_window_start_idx": int(window_start_idx),
     }
 
 
 def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateConfig) -> NPBatch:
     context_x, context_y, context_yerr, context_band, context_mask = [], [], [], [], []
     target_x, target_y, target_yerr, target_band, target_mask = [], [], [], [], []
-    labels, redshifts = [], []
+    labels, interesting_labels, redshifts = [], [], []
     morph_targets = []
     metadata = {"oid": [], "obs_snr": [], "target_is_peak": [], "morph_names": MORPH_NAMES, "context_n_points": [], "context_span_days": [], "context_n_bands": []}
 
@@ -351,6 +506,7 @@ def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateCo
             context_n_points = split["context_n_points"]
             context_span_days = split["context_raw_span_days"]
             context_n_bands = split["context_n_bands"]
+            interesting_label = split["interesting_label"]
         else:
             ctx_t_parts, ctx_f_parts, ctx_fe_parts, ctx_b_parts = [], [], [], []
             tgt_t_parts, tgt_f_parts, tgt_fe_parts, tgt_b_parts = [], [], [], []
@@ -414,6 +570,7 @@ def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateCo
             context_n_points = int(len(cx))
             context_span_days = float(item["t_raw"][np.argsort(item["t_norm"])[:len(cx)]][-1] - item["t_raw"][np.argsort(item["t_norm"])[:len(cx)]][0]) if len(cx) >= 2 else 0.0
             context_n_bands = int(len(np.unique(cb))) if len(cb) > 0 else 0
+            interesting_label = float(_interesting_label_from_indices(item, np.argsort(item["t_norm"])[:len(cx)], cfg)) if len(cx) > 0 else 0.0
 
         context_x.append(torch.as_tensor(cx, dtype=torch.float32))
         context_y.append(torch.as_tensor(cy, dtype=torch.float32))
@@ -426,6 +583,7 @@ def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateCo
         target_band.append(torch.as_tensor(tb, dtype=torch.long))
         target_mask.append(torch.ones(len(tx), dtype=torch.float32))
         labels.append(float(item["target"]))
+        interesting_labels.append(float(interesting_label))
         redshifts.append(float(item.get("z", np.nan)))
         raw_morph = item.get("morph_raw", np.zeros(4, dtype=np.float32)).astype(np.float32)
         if cfg.morph_mean is not None and cfg.morph_std is not None:
@@ -459,6 +617,7 @@ def build_mallorn_batch(items: List[dict], training: bool, cfg: MallornCollateCo
         target_band=_pad(target_band, pad_value=0, dtype=torch.long).long(),
         target_mask=_pad(target_mask),
         labels=torch.as_tensor(labels, dtype=torch.float32),
+        interesting_labels=torch.as_tensor(interesting_labels, dtype=torch.float32),
         redshift=normalize_redshift(torch.as_tensor(redshifts, dtype=torch.float32), cfg.z_min, cfg.z_max),
         morph_targets=torch.stack(morph_targets, dim=0),
         metadata={
@@ -486,6 +645,20 @@ def prepare_mallorn_datasets(
     keep_all_snr_gt: float = 5.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, MallornDataset, MallornDataset, List[str], List[str]]:
     lc, log = load_all_data(data_dir)
+    lc, log = preprocess_mallorn_training_tables(lc, log, max_obs=max_obs, keep_all_snr_gt=keep_all_snr_gt)
+    all_ids = log["object_id"].tolist()
+    all_tgts = log["target"].tolist()
+    train_ids, val_ids = train_test_split(all_ids, test_size=val_frac, stratify=all_tgts, random_state=seed)
+    return build_mallorn_datasets_from_ids(lc, log, train_ids, val_ids)
+
+
+def preprocess_mallorn_training_tables(
+    lc: pd.DataFrame,
+    log: pd.DataFrame,
+    *,
+    max_obs: int = 200,
+    keep_all_snr_gt: float = 5.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     lc = apply_ebv_correction(lc, log)
     lc_ids = set(lc["object_id"].unique())
     log = log[log["object_id"].isin(lc_ids)].reset_index(drop=True)
@@ -500,12 +673,18 @@ def prepare_mallorn_datasets(
     usable_ids = valid_object_ids(lc, min_obs=3)
     lc = lc[lc["object_id"].isin(usable_ids)].reset_index(drop=True)
     log = log[log["object_id"].isin(usable_ids)].reset_index(drop=True)
+    return lc, log
 
-    all_ids = log["object_id"].tolist()
-    all_tgts = log["target"].tolist()
-    train_ids, val_ids = train_test_split(all_ids, test_size=val_frac, stratify=all_tgts, random_state=seed)
-    train_ds = MallornDataset(train_ids, lc, log)
-    val_ds = MallornDataset(val_ids, lc, log)
+
+def build_mallorn_datasets_from_ids(
+    lc: pd.DataFrame,
+    log: pd.DataFrame,
+    train_ids: List[str],
+    val_ids: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame, MallornDataset, MallornDataset, List[str], List[str]]:
+    flux_center_by_band, flux_scale_by_band = compute_flux_norm_stats(lc, train_ids)
+    train_ds = MallornDataset(train_ids, lc, log, flux_center_by_band=flux_center_by_band, flux_scale_by_band=flux_scale_by_band)
+    val_ds = MallornDataset(val_ids, lc, log, flux_center_by_band=flux_center_by_band, flux_scale_by_band=flux_scale_by_band)
     train_ids = train_ds.object_ids
     val_ids = val_ds.object_ids
     return lc, log, train_ds, val_ds, train_ids, val_ids

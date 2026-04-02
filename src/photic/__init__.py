@@ -9,7 +9,7 @@ from .alerts import (
     JointAlertForecaster,
 )
 from .batch import NPBatch, collate_irregular_samples
-from .config import ConvGNPJointConfig, JointLossConfig
+from .config import AttentiveNPJointConfig, ConvGNPJointConfig, JointLossConfig
 from .data import (
     BANDS,
     BAND2IDX,
@@ -19,6 +19,7 @@ from .data import (
     apply_ebv_correction,
     build_mallorn_batch,
     cap_observations,
+    compute_flux_norm_stats,
     compute_z_norm_stats,
     load_all_data,
     make_mallorn_collate,
@@ -27,7 +28,7 @@ from .data import (
 )
 from .gui import run_forecast_viewer
 from .losses import JointLosses, gaussian_reconstruction_nll, joint_loss
-from .model import ConvGNPJointModel, JointModelOutput
+from .model import AttentiveNPJointModel, ConvGNPJointModel, JointModelOutput, build_joint_model, load_joint_model_checkpoint
 from .train import evaluate_epoch, evaluate_mallorn_epoch, fit_epoch
 
 __all__ = [
@@ -42,6 +43,7 @@ __all__ = [
     "NPBatch",
     "collate_irregular_samples",
     "ConvGNPJointConfig",
+    "AttentiveNPJointConfig",
     "JointLossConfig",
     "BANDS",
     "BAND2IDX",
@@ -51,6 +53,7 @@ __all__ = [
     "apply_ebv_correction",
     "build_mallorn_batch",
     "cap_observations",
+    "compute_flux_norm_stats",
     "compute_z_norm_stats",
     "load_all_data",
     "make_mallorn_collate",
@@ -61,6 +64,9 @@ __all__ = [
     "joint_loss",
     "JointModelOutput",
     "ConvGNPJointModel",
+    "AttentiveNPJointModel",
+    "build_joint_model",
+    "load_joint_model_checkpoint",
     "fit_epoch",
     "evaluate_epoch",
     "evaluate_mallorn_epoch",

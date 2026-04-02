@@ -8,9 +8,8 @@ import numpy as np
 import torch
 
 from .batch import NPBatch
-from .config import ConvGNPJointConfig
 from .data import BANDS, BAND2IDX, normalize_redshift
-from .model import ConvGNPJointModel
+from .model import load_joint_model_checkpoint
 
 
 @dataclass(slots=True)
@@ -58,8 +57,8 @@ class ForecastResult:
     class_logit: float
     redshift: float | None
     context_points: int
-    flux_mean: float
-    flux_std: float
+    flux_center_by_band: list[float]
+    flux_scale_by_band: list[float]
     t_min: float
     t_span: float
     bands: dict[str, ForecastBandCurve]
@@ -101,6 +100,47 @@ def _normalize_alert_photometry(points: list[AlertPhotometryPoint]) -> dict[str,
         "t_norm": t_norm.astype(np.float32),
         "flux_mean": flux_mean,
         "flux_std": flux_std,
+        "flux_norm": flux_norm.astype(np.float32),
+        "ferr_norm": ferr_norm.astype(np.float32),
+    }
+
+
+def _normalize_alert_photometry_with_stats(
+    points: list[AlertPhotometryPoint],
+    flux_center_by_band: np.ndarray,
+    flux_scale_by_band: np.ndarray,
+) -> dict[str, np.ndarray]:
+    if not points:
+        raise ValueError("At least one photometry point is required.")
+    rows = [
+        (float(p.mjd), p.band, float(p.flux), max(float(p.flux_err), 1e-6))
+        for p in points
+        if p.band in BAND2IDX
+    ]
+    if not rows:
+        raise ValueError(f"No photometry points with supported bands: {BANDS}")
+    rows.sort(key=lambda x: x[0])
+    t_raw = np.asarray([r[0] for r in rows], dtype=np.float32)
+    flux_raw = np.asarray([r[2] for r in rows], dtype=np.float32)
+    ferr_raw = np.asarray([r[3] for r in rows], dtype=np.float32)
+    band_idx = np.asarray([BAND2IDX[r[1]] for r in rows], dtype=np.int64)
+    t_min = float(t_raw.min())
+    t_span = max(float(t_raw.max() - t_raw.min()), 1.0)
+    t_norm = (t_raw - t_min) / t_span
+    centers = np.asarray(flux_center_by_band, dtype=np.float32)[band_idx]
+    scales = np.asarray(flux_scale_by_band, dtype=np.float32)[band_idx]
+    flux_norm = (flux_raw - centers) / scales
+    ferr_norm = ferr_raw / scales
+    return {
+        "t_raw": t_raw,
+        "flux_raw": flux_raw,
+        "ferr_raw": ferr_raw,
+        "band_idx": band_idx,
+        "t_min": t_min,
+        "t_span": t_span,
+        "t_norm": t_norm.astype(np.float32),
+        "flux_center_by_band": np.asarray(flux_center_by_band, dtype=np.float32),
+        "flux_scale_by_band": np.asarray(flux_scale_by_band, dtype=np.float32),
         "flux_norm": flux_norm.astype(np.float32),
         "ferr_norm": ferr_norm.astype(np.float32),
     }
@@ -345,10 +385,12 @@ def _safe_int(value) -> int | None:
 class JointAlertForecaster:
     def __init__(
         self,
-        model: ConvGNPJointModel,
+        model,
         *,
         z_min: float,
         z_max: float,
+        flux_center_by_band: np.ndarray,
+        flux_scale_by_band: np.ndarray,
         device: str | torch.device = "cpu",
     ):
         self.model = model.to(device)
@@ -356,17 +398,18 @@ class JointAlertForecaster:
         self.device = device
         self.z_min = float(z_min)
         self.z_max = float(z_max)
+        self.flux_center_by_band = np.asarray(flux_center_by_band, dtype=np.float32)
+        self.flux_scale_by_band = np.asarray(flux_scale_by_band, dtype=np.float32)
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str | Path, device: str | torch.device = "cpu") -> "JointAlertForecaster":
-        ckpt = torch.load(checkpoint_path, map_location=device)
-        model_cfg = ConvGNPJointConfig(**ckpt["model_cfg"])
-        model = ConvGNPJointModel(model_cfg)
-        model.load_state_dict(ckpt["model_state"])
+        model, ckpt = load_joint_model_checkpoint(checkpoint_path, device=device)
         return cls(
             model,
             z_min=float(ckpt.get("z_min", 0.0)),
             z_max=float(ckpt.get("z_max", 1.0)),
+            flux_center_by_band=np.asarray(ckpt.get("flux_center_by_band", np.zeros(len(BANDS))), dtype=np.float32),
+            flux_scale_by_band=np.asarray(ckpt.get("flux_scale_by_band", np.ones(len(BANDS))), dtype=np.float32),
             device=device,
         )
 
@@ -377,7 +420,7 @@ class JointAlertForecaster:
         forecast_days: float = 365.0,
         grid_points_per_band: int = 256,
     ) -> tuple[NPBatch, dict[str, float | np.ndarray]]:
-        norm = _normalize_alert_photometry(alert.photometry)
+        norm = _normalize_alert_photometry_with_stats(alert.photometry, self.flux_center_by_band, self.flux_scale_by_band)
         future_days = _future_query_grid(forecast_days=forecast_days, grid_points_per_band=grid_points_per_band)
         query_t_raw_parts = []
         query_t_norm_parts = []
@@ -412,8 +455,8 @@ class JointAlertForecaster:
         aux = {
             "query_t_raw": np.concatenate(query_t_raw_parts),
             "query_band_idx": np.concatenate(query_band_parts),
-            "flux_mean": norm["flux_mean"],
-            "flux_std": norm["flux_std"],
+            "flux_center_by_band": norm["flux_center_by_band"],
+            "flux_scale_by_band": norm["flux_scale_by_band"],
             "t_min": norm["t_min"],
             "t_span": norm["t_span"],
             "n_context": len(norm["t_norm"]),
@@ -439,17 +482,19 @@ class JointAlertForecaster:
 
         class_logit = float(out.class_logits[0].detach().cpu().item()) if out.class_logits is not None else float("nan")
         prob_tde = float(torch.sigmoid(out.class_logits)[0].detach().cpu().item()) if out.class_logits is not None else float("nan")
-        pred_mean = out.pred_mean[0].detach().cpu().numpy() * float(aux["flux_std"]) + float(aux["flux_mean"])
-        pred_sigma = torch.sqrt(out.pred_var[0].clamp_min(1e-8)).detach().cpu().numpy() * float(aux["flux_std"])
+        query_band_idx = np.asarray(aux["query_band_idx"], dtype=np.int64)
+        query_centers = np.asarray(aux["flux_center_by_band"], dtype=np.float32)[query_band_idx]
+        query_scales = np.asarray(aux["flux_scale_by_band"], dtype=np.float32)[query_band_idx]
+        pred_mean = out.pred_mean[0].detach().cpu().numpy() * query_scales + query_centers
+        pred_sigma = torch.sqrt(out.pred_var[0].clamp_min(1e-8)).detach().cpu().numpy() * query_scales
 
         sample_means = None
         if latent_samples > 0 and getattr(self.model.cfg, "use_latent", False):
             means_s, _ = self.model.sample_predictions(batch, num_samples=latent_samples)
-            sample_means = means_s[:, 0].detach().cpu().numpy() * float(aux["flux_std"]) + float(aux["flux_mean"])
+            sample_means = means_s[:, 0].detach().cpu().numpy() * query_scales[None, :] + query_centers[None, :]
 
         bands: dict[str, ForecastBandCurve] = {}
         query_t_raw = np.asarray(aux["query_t_raw"], dtype=np.float32)
-        query_band_idx = np.asarray(aux["query_band_idx"], dtype=np.int64)
         for band in BANDS:
             bi = BAND2IDX[band]
             mask = query_band_idx == bi
@@ -468,8 +513,8 @@ class JointAlertForecaster:
             class_logit=class_logit,
             redshift=alert.redshift,
             context_points=int(aux["n_context"]),
-            flux_mean=float(aux["flux_mean"]),
-            flux_std=float(aux["flux_std"]),
+            flux_center_by_band=np.asarray(aux["flux_center_by_band"], dtype=np.float32).tolist(),
+            flux_scale_by_band=np.asarray(aux["flux_scale_by_band"], dtype=np.float32).tolist(),
             t_min=float(aux["t_min"]),
             t_span=float(aux["t_span"]),
             bands=bands,

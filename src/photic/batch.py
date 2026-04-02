@@ -21,6 +21,7 @@ class NPBatch:
     target_mask: torch.Tensor
 
     labels: torch.Tensor | None = None
+    interesting_labels: torch.Tensor | None = None
     redshift: torch.Tensor | None = None
     morph_targets: torch.Tensor | None = None
     metadata: dict[str, torch.Tensor] | None = None
@@ -41,6 +42,7 @@ class NPBatch:
             target_band=self.target_band.to(device),
             target_mask=self.target_mask.to(device),
             labels=None if self.labels is None else self.labels.to(device),
+            interesting_labels=None if self.interesting_labels is None else self.interesting_labels.to(device),
             redshift=None if self.redshift is None else self.redshift.to(device),
             morph_targets=None if self.morph_targets is None else self.morph_targets.to(device),
             metadata=md,
@@ -78,6 +80,10 @@ def collate_irregular_samples(samples: Iterable[dict[str, Any]]) -> NPBatch:
     if "redshift" in samples[0]:
         redshift = torch.as_tensor([float(s["redshift"]) for s in samples], dtype=torch.float32)
 
+    interesting_labels = None
+    if "interesting_label" in samples[0]:
+        interesting_labels = torch.as_tensor([float(s["interesting_label"]) for s in samples], dtype=torch.float32)
+
     morph_targets = None
     if "morph_targets" in samples[0]:
         morph_targets = torch.stack([torch.as_tensor(s["morph_targets"], dtype=torch.float32) for s in samples], dim=0)
@@ -94,6 +100,7 @@ def collate_irregular_samples(samples: Iterable[dict[str, Any]]) -> NPBatch:
         target_band=tgt_band,
         target_mask=tgt_mask,
         labels=labels,
+        interesting_labels=interesting_labels,
         redshift=redshift,
         morph_targets=morph_targets,
     )

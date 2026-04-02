@@ -62,6 +62,9 @@ def eval_step(model: ConvGNPJointModel, batch: NPBatch, loss_cfg: JointLossConfi
     metrics = {}
     if out.class_logits is not None and batch.labels is not None:
         metrics.update(evaluate_binary_predictions(out.class_logits, batch.labels))
+    if out.interesting_logits is not None and batch.interesting_labels is not None:
+        interesting = evaluate_binary_predictions(out.interesting_logits, batch.interesting_labels)
+        metrics.update({f"interesting_{k}": v for k, v in interesting.items()})
     return losses, metrics
 
 
@@ -80,7 +83,7 @@ def _context_bin_metrics(
 ) -> dict[str, float]:
     metrics: dict[str, float] = {}
     if context_points is not None:
-        for limit in (3, 5, 10):
+        for limit in (3, 5, 10, 20, 40, 80):
             mask = context_points <= limit
             if int(mask.sum().item()) >= 2 and int(labels[mask].sum().item()) >= 1 and int((1 - labels[mask]).sum().item()) >= 1:
                 sub = evaluate_binary_predictions(logits[mask], labels[mask])
@@ -88,7 +91,7 @@ def _context_bin_metrics(
                 metrics[f"ap_ctx_le_{limit}"] = sub["ap"]
                 metrics[f"n_ctx_le_{limit}"] = float(mask.sum().item())
     if context_days is not None:
-        for limit in (7, 30, 90):
+        for limit in (7, 30, 60, 90, 120, 180):
             mask = context_days <= limit
             if int(mask.sum().item()) >= 2 and int(labels[mask].sum().item()) >= 1 and int((1 - labels[mask]).sum().item()) >= 1:
                 sub = evaluate_binary_predictions(logits[mask], labels[mask])
@@ -108,6 +111,7 @@ def fit_epoch(model: ConvGNPJointModel, loader, optimizer, loss_cfg: JointLossCo
             "total": float(losses.total.item()),
             "recon": float(losses.recon.item()),
             "cls": float(losses.cls.item()),
+            "interesting": float(losses.interesting.item()),
             "morph": float(losses.morph.item()),
             "kl": float(losses.kl.item()),
         })
@@ -125,6 +129,7 @@ def evaluate_epoch(model: ConvGNPJointModel, loader, loss_cfg: JointLossConfig, 
             "total": float(losses.total.item()),
             "recon": float(losses.recon.item()),
             "cls": float(losses.cls.item()),
+            "interesting": float(losses.interesting.item()),
             "morph": float(losses.morph.item()),
             "kl": float(losses.kl.item()),
         })
@@ -141,6 +146,7 @@ def evaluate_mallorn_epoch(model: ConvGNPJointModel, loader, loss_cfg: JointLoss
     loss_rows = []
     records = {"tde": [], "nontde": []}
     all_logits, all_labels = [], []
+    all_interesting_logits, all_interesting_labels = [], []
     all_context_points, all_context_days = [], []
 
     for batch in loader:
@@ -151,6 +157,7 @@ def evaluate_mallorn_epoch(model: ConvGNPJointModel, loader, loss_cfg: JointLoss
             "total": float(losses.total.item()),
             "recon": float(losses.recon.item()),
             "cls": float(losses.cls.item()),
+            "interesting": float(losses.interesting.item()),
             "morph": float(losses.morph.item()),
             "kl": float(losses.kl.item()),
         })
@@ -162,6 +169,9 @@ def evaluate_mallorn_epoch(model: ConvGNPJointModel, loader, loss_cfg: JointLoss
                 all_context_points.append(batch.metadata["context_n_points"].detach().cpu())
             if batch.metadata is not None and "context_span_days" in batch.metadata:
                 all_context_days.append(batch.metadata["context_span_days"].detach().cpu())
+        if out.interesting_logits is not None and batch.interesting_labels is not None:
+            all_interesting_logits.append(out.interesting_logits.detach().cpu())
+            all_interesting_labels.append(batch.interesting_labels.detach().cpu())
 
         obs_snr = batch.metadata["obs_snr"] if batch.metadata is not None and "obs_snr" in batch.metadata else None
         for i in range(batch.target_x.shape[0]):
@@ -181,6 +191,10 @@ def evaluate_mallorn_epoch(model: ConvGNPJointModel, loader, loss_cfg: JointLoss
         context_points = torch.cat(all_context_points) if all_context_points else None
         context_days = torch.cat(all_context_days) if all_context_days else None
         metrics.update(_context_bin_metrics(logits, labels, context_points, context_days))
+    if all_interesting_logits:
+        ilogits = torch.cat(all_interesting_logits)
+        ilabels = torch.cat(all_interesting_labels)
+        metrics.update({f"interesting_{k}": v for k, v in evaluate_binary_predictions(ilogits, ilabels).items()})
 
     for key in ["tde", "nontde"]:
         recs = records[key]
