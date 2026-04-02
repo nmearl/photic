@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.py[oc]
+*.pt
+*.pth
+*.ckpt
+data/
+checkpoints/
+*.egg-info
+build/
+dist/
+wheels/
+.python-version
