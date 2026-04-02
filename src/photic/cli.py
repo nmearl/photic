@@ -153,6 +153,11 @@ def _photometry_to_dict(alert_object) -> list[dict]:
 @click.option("--seed", type=int, default=42, show_default=True)
 @click.option("--num-workers", type=int, default=4, show_default=True)
 @click.option("--val-frac", type=float, default=0.15, show_default=True)
+@click.option("--context-strategy", type=click.Choice(["prefix", "random"]), default="prefix", show_default=True)
+@click.option("--min-context-points-total", type=int, default=3, show_default=True)
+@click.option("--min-target-points-total", type=int, default=1, show_default=True)
+@click.option("--prefix-context-frac-min", type=float, default=0.15, show_default=True)
+@click.option("--prefix-context-frac-max", type=float, default=0.60, show_default=True)
 @click.option("--mask-prob", type=float, default=0.50, show_default=True)
 @click.option("--block-mask-prob", type=float, default=0.50, show_default=True)
 @click.option("--block-mask-frac", type=float, default=0.35, show_default=True)
@@ -192,6 +197,11 @@ def train_mallorn(
     seed: int,
     num_workers: int,
     val_frac: float,
+    context_strategy: str,
+    min_context_points_total: int,
+    min_target_points_total: int,
+    prefix_context_frac_min: float,
+    prefix_context_frac_max: float,
     mask_prob: float,
     block_mask_prob: float,
     block_mask_frac: float,
@@ -238,6 +248,11 @@ def train_mallorn(
     morph_mean, morph_std = compute_morphology_norm_stats(train_ds)
     base_collate_cfg = MallornCollateConfig(
         seed=seed,
+        context_strategy=context_strategy,
+        min_ctx_points_total=min_context_points_total,
+        min_target_points_total=min_target_points_total,
+        prefix_context_frac_min=prefix_context_frac_min,
+        prefix_context_frac_max=prefix_context_frac_max,
         mask_prob=mask_prob,
         block_mask_prob=block_mask_prob,
         block_mask_frac=block_mask_frac,
@@ -278,6 +293,10 @@ def train_mallorn(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=60, T_mult=2, eta_min=1.5e-6)
 
     click.echo(f"[data] train={len(train_ds)} val={len(val_ds)} z_norm=[{z_min:.3f}, {z_max:.3f}] pos_weight={pos_weight:.3f}")
+    click.echo(
+        f"[context] strategy={context_strategy} min_ctx_total={min_context_points_total} "
+        f"min_tgt_total={min_target_points_total} prefix_frac=[{prefix_context_frac_min:.2f}, {prefix_context_frac_max:.2f}]"
+    )
     click.echo(f"[morph] lambda_morph={lambda_morph:.3f} mean={morph_mean.tolist()} std={morph_std.tolist()}")
     click.echo(f"[loss] peak_weight_snr_boost={peak_weight_snr_boost:.3f} peak_weight_flux_boost={peak_weight_flux_boost:.3f} threshold={peak_weight_snr_threshold:.2f} flux_q={peak_weight_flux_quantile:.2f}")
     click.echo(f"[selection] primary_checkpoint={checkpoint_metric} stage2_from={stage2_from_metric} stage2_epochs={stage2_epochs}")
