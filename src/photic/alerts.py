@@ -203,12 +203,9 @@ class AlerceBrokerClient:
                 survey=self.survey,
                 format="json",
             )
-            points = self._photometry_rows_to_points(forced)
+            points = self._merge_points(points, self._photometry_rows_to_points(forced))
         except Exception:
-            points = []
-
-        if len(points) >= 2:
-            return points
+            pass
 
         try:
             lightcurve = self.client.query_lightcurve(
@@ -221,16 +218,16 @@ class AlerceBrokerClient:
         except Exception:
             pass
 
-        if len(points) >= 2:
-            return points
-
         detections = self.client.query_detections(
             object_id,
             survey=self.survey,
             format="json",
         )
         detection_points = self._detections_to_points(detections)
-        return self._merge_points(points, detection_points)
+        points = self._merge_points(points, detection_points)
+        if not points:
+            raise ValueError(f"No usable photometry returned from ALeRCE for object {object_id}.")
+        return points
 
     @staticmethod
     def _detections_to_points(detections) -> list[AlertPhotometryPoint]:
@@ -385,8 +382,10 @@ class JointAlertForecaster:
         query_t_raw_parts = []
         query_t_norm_parts = []
         query_band_parts = []
+        query_start = float(norm["t_min"])
+        query_end = float(norm["t_raw"][-1] + forecast_days)
         for band in BANDS:
-            query_t_raw = norm["t_raw"][-1] + future_days
+            query_t_raw = np.linspace(query_start, query_end, grid_points_per_band, dtype=np.float32)
             query_t_norm = (query_t_raw - norm["t_min"]) / norm["t_span"]
             query_t_raw_parts.append(query_t_raw.astype(np.float32))
             query_t_norm_parts.append(query_t_norm.astype(np.float32))
