@@ -163,8 +163,8 @@ def run_forecast_viewer(
                             ui.label(f"N detections: {update.get('ndet', 'n/a')}")
                         with ui.column().classes("gap-1"):
                             ui.label("Forecast").classes("text-subtitle2")
-                            ui.label(f"Flux mean: {forecast.get('flux_mean', 'n/a')}")
-                            ui.label(f"Flux std: {forecast.get('flux_std', 'n/a')}")
+                            ui.label(f"Flux centers: {forecast.get('flux_center_by_band', 'n/a')}")
+                            ui.label(f"Flux scales: {forecast.get('flux_scale_by_band', 'n/a')}")
                             ui.label(f"t_span: {forecast.get('t_span', 'n/a')}")
 
     def refresh_files():
