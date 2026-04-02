@@ -72,6 +72,32 @@ def _mean_dict(list_of_dicts: list[dict[str, float]]) -> dict[str, float]:
     return {k: float(np.mean([d[k] for d in list_of_dicts])) for k in keys}
 
 
+def _context_bin_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    context_points: torch.Tensor | None,
+    context_days: torch.Tensor | None,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    if context_points is not None:
+        for limit in (3, 5, 10):
+            mask = context_points <= limit
+            if int(mask.sum().item()) >= 2 and int(labels[mask].sum().item()) >= 1 and int((1 - labels[mask]).sum().item()) >= 1:
+                sub = evaluate_binary_predictions(logits[mask], labels[mask])
+                metrics[f"best_f1_ctx_le_{limit}"] = sub["best_f1"]
+                metrics[f"ap_ctx_le_{limit}"] = sub["ap"]
+                metrics[f"n_ctx_le_{limit}"] = float(mask.sum().item())
+    if context_days is not None:
+        for limit in (7, 30, 90):
+            mask = context_days <= limit
+            if int(mask.sum().item()) >= 2 and int(labels[mask].sum().item()) >= 1 and int((1 - labels[mask]).sum().item()) >= 1:
+                sub = evaluate_binary_predictions(logits[mask], labels[mask])
+                metrics[f"best_f1_days_le_{limit}"] = sub["best_f1"]
+                metrics[f"ap_days_le_{limit}"] = sub["ap"]
+                metrics[f"n_days_le_{limit}"] = float(mask.sum().item())
+    return metrics
+
+
 def fit_epoch(model: ConvGNPJointModel, loader, optimizer, loss_cfg: JointLossConfig, device: str | torch.device) -> dict[str, float]:
     model.train()
     metrics = []
@@ -115,6 +141,7 @@ def evaluate_mallorn_epoch(model: ConvGNPJointModel, loader, loss_cfg: JointLoss
     loss_rows = []
     records = {"tde": [], "nontde": []}
     all_logits, all_labels = [], []
+    all_context_points, all_context_days = [], []
 
     for batch in loader:
         batch = batch.to(device)
@@ -131,6 +158,10 @@ def evaluate_mallorn_epoch(model: ConvGNPJointModel, loader, loss_cfg: JointLoss
         if out.class_logits is not None and batch.labels is not None:
             all_logits.append(out.class_logits.detach().cpu())
             all_labels.append(batch.labels.detach().cpu())
+            if batch.metadata is not None and "context_n_points" in batch.metadata:
+                all_context_points.append(batch.metadata["context_n_points"].detach().cpu())
+            if batch.metadata is not None and "context_span_days" in batch.metadata:
+                all_context_days.append(batch.metadata["context_span_days"].detach().cpu())
 
         obs_snr = batch.metadata["obs_snr"] if batch.metadata is not None and "obs_snr" in batch.metadata else None
         for i in range(batch.target_x.shape[0]):
@@ -147,6 +178,9 @@ def evaluate_mallorn_epoch(model: ConvGNPJointModel, loader, loss_cfg: JointLoss
         logits = torch.cat(all_logits)
         labels = torch.cat(all_labels)
         metrics.update(evaluate_binary_predictions(logits, labels))
+        context_points = torch.cat(all_context_points) if all_context_points else None
+        context_days = torch.cat(all_context_days) if all_context_days else None
+        metrics.update(_context_bin_metrics(logits, labels, context_points, context_days))
 
     for key in ["tde", "nontde"]:
         recs = records[key]
