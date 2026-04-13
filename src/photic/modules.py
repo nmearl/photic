@@ -54,9 +54,9 @@ class ConvBackbone1D(nn.Module):
 
 
 class GaussianSetConv1D(nn.Module):
-    def __init__(self, sigma: float):
+    def __init__(self, sigmas: tuple[float, ...]):
         super().__init__()
-        self.sigma = sigma
+        self.sigmas = sigmas
 
     def forward(
         self,
@@ -66,12 +66,16 @@ class GaussianSetConv1D(nn.Module):
         grid_x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # point_x: (B, N), point_feat: (B, N, C), point_mask: (B, N), grid_x: (G,)
-        dx = point_x.unsqueeze(-1) - grid_x.view(1, 1, -1)
-        weights = torch.exp(-0.5 * (dx / self.sigma) ** 2) * point_mask.unsqueeze(-1)
-        denom = weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        agg = torch.einsum("bng,bnc->bgc", weights, point_feat) / denom.squeeze(1).unsqueeze(-1)
-        density = weights.sum(dim=1)
-        return agg, density
+        # returns: agg (B, G, S*C), density (B, G, S) where S = len(sigmas)
+        dx = point_x.unsqueeze(-1) - grid_x.view(1, 1, -1)  # (B, N, G)
+        aggs, densities = [], []
+        for sigma in self.sigmas:
+            weights = torch.exp(-0.5 * (dx / sigma) ** 2) * point_mask.unsqueeze(-1)
+            denom = weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            agg = torch.einsum("bng,bnc->bgc", weights, point_feat) / denom.squeeze(1).unsqueeze(-1)
+            aggs.append(agg)
+            densities.append(weights.sum(dim=1).unsqueeze(-1))  # (B, G, 1)
+        return torch.cat(aggs, dim=-1), torch.cat(densities, dim=-1)
 
 
 class GlobalLatentEncoder(nn.Module):
