@@ -30,7 +30,7 @@ from .baseline import (
     prepare_mallorn_baseline_test_dataset,
     save_baseline_checkpoint,
 )
-from .elasticc import META_FIELDS, load_elasticc_focus_records
+from .elasticc import META_FIELDS, NUM_ELASTICC_CLASSES, load_elasticc_focus_records
 
 
 @click.group()
@@ -84,6 +84,8 @@ def _train_single_split(
     checkpoint_metric: str,
     device: str,
     full_context_eval: bool = False,
+    num_classes: int = 1,
+    class_weights: tuple[float, ...] | None = None,
 ):
     z_min, z_max = compute_z_bounds(train_ds)
     train_cfg = BaselineCollateConfig(
@@ -123,9 +125,12 @@ def _train_single_split(
         cfg=val_cfg,
     )
 
-    pos_count = float(sum(int(train_ds.data[oid]["target"]) == 1 for oid in train_ds.object_ids))
-    neg_count = float(sum(int(train_ds.data[oid]["target"]) == 0 for oid in train_ds.object_ids))
-    pos_weight = neg_count / max(pos_count, 1.0)
+    if num_classes == 1:
+        pos_count = float(sum(int(train_ds.data[oid]["target"]) == 1 for oid in train_ds.object_ids))
+        neg_count = float(sum(int(train_ds.data[oid]["target"]) == 0 for oid in train_ds.object_ids))
+        _pos_weight: float | None = neg_count / max(pos_count, 1.0)
+    else:
+        _pos_weight = None
     model_cfg = ConvGNPBaselineConfig(
         band_emb_dim=band_emb_dim,
         time_fourier_dim=time_fourier_dim,
@@ -146,8 +151,9 @@ def _train_single_split(
         use_latent=use_latent,
         latent_dim=latent_dim,
         latent_hidden_dim=latent_hidden_dim,
+        num_classes=num_classes,
     )
-    loss_cfg = BaselineLossConfig(lambda_recon=lambda_recon, lambda_cls=lambda_cls, pos_weight=pos_weight, beta_kl=beta_kl, kl_warmup_epochs=kl_warmup_epochs)
+    loss_cfg = BaselineLossConfig(lambda_recon=lambda_recon, lambda_cls=lambda_cls, pos_weight=_pos_weight, beta_kl=beta_kl, kl_warmup_epochs=kl_warmup_epochs, class_weights=class_weights)
     model = ConvGNPBaseline(model_cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     warmup_epochs = min(10, max(1, epochs // 10))
@@ -462,7 +468,8 @@ def train_mallorn_baseline(
 @click.option("--use-latent/--no-latent", default=True, show_default=True)
 @click.option("--latent-dim", type=int, default=8, show_default=True)
 @click.option("--latent-hidden-dim", type=int, default=64, show_default=True)
-@click.option("--checkpoint-metric", type=click.Choice(["best_f1", "ap", "recon"]), default="ap", show_default=True)
+@click.option("--num-classes", type=int, default=7, show_default=True)
+@click.option("--checkpoint-metric", type=click.Choice(["best_f1", "ap", "recon", "macro_f1", "weighted_f1", "macro_auroc"]), default="macro_f1", show_default=True)
 @click.option("--max-release-dirs", type=int, default=None)
 @click.option("--max-shards-per-release", type=int, default=None)
 @click.option("--max-objects-per-release", type=int, default=None)
@@ -505,12 +512,17 @@ def train_elasticc_focus_baseline(
     use_latent: bool,
     latent_dim: int,
     latent_hidden_dim: int,
+    num_classes: int,
     checkpoint_metric: str,
     max_release_dirs: int | None,
     max_shards_per_release: int | None,
     max_objects_per_release: int | None,
     device: str | None,
 ):
+    if num_classes < NUM_ELASTICC_CLASSES:
+        raise click.ClickException(
+            f"--num-classes must be at least {NUM_ELASTICC_CLASSES} for the current ELAsTiCC taxonomy"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(seed)
@@ -530,6 +542,17 @@ def train_elasticc_focus_baseline(
     train_records = [records[int(i)] for i in train_idx]
     val_records = [records[int(i)] for i in val_idx]
     train_ds, val_ds = build_precomputed_baseline_datasets(train_records=train_records, val_records=val_records, use_rest_frame_time=use_rest_frame_time)
+
+    # Compute inverse-frequency class weights for multi-class
+    _class_weights: tuple[float, ...] | None = None
+    if num_classes > 1:
+        train_labels = np.array([int(train_ds.data[oid]["target"]) for oid in train_ds.object_ids])
+        counts = np.bincount(train_labels, minlength=num_classes).astype(float)
+        counts = np.where(counts == 0, 1.0, counts)
+        inv_freq = 1.0 / counts
+        inv_freq = inv_freq / inv_freq.sum() * num_classes
+        _class_weights = tuple(float(w) for w in inv_freq)
+
     model, model_cfg, loss_cfg, metrics, best_epoch, z_min, z_max = _train_single_split(
         train_ds=train_ds,
         val_ds=val_ds,
@@ -569,12 +592,22 @@ def train_elasticc_focus_baseline(
         latent_hidden_dim=latent_hidden_dim,
         checkpoint_metric=checkpoint_metric,
         device=device,
+        num_classes=num_classes,
+        class_weights=_class_weights,
     )
-    click.echo(
-        f"[elasticc] train={len(train_ds)} val={len(val_ds)} use_metadata={str(use_metadata).lower()} "
-        f"best_f1={metrics.get('best_f1', float('nan')):.4f} ap={metrics.get('ap', float('nan')):.4f} "
-        f"recon={metrics.get('recon', float('nan')):.4f}"
-    )
+    if num_classes > 1:
+        click.echo(
+            f"[elasticc] train={len(train_ds)} val={len(val_ds)} use_metadata={str(use_metadata).lower()} "
+            f"macro_f1={metrics.get('macro_f1', float('nan')):.4f} "
+            f"macro_auroc={metrics.get('macro_auroc', float('nan')):.4f} "
+            f"recon={metrics.get('recon', float('nan')):.4f}"
+        )
+    else:
+        click.echo(
+            f"[elasticc] train={len(train_ds)} val={len(val_ds)} use_metadata={str(use_metadata).lower()} "
+            f"best_f1={metrics.get('best_f1', float('nan')):.4f} ap={metrics.get('ap', float('nan')):.4f} "
+            f"recon={metrics.get('recon', float('nan')):.4f}"
+        )
     save_baseline_checkpoint(
         out_dir / "best_primary_checkpoint.pt",
         model=model,

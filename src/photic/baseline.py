@@ -100,6 +100,7 @@ class ConvGNPBaselineConfig:
     use_latent: bool = True
     latent_dim: int = 8
     latent_hidden_dim: int = 64
+    num_classes: int = 1
 
 
 @dataclass(slots=True)
@@ -119,6 +120,7 @@ class BaselineLossConfig:
     pos_weight: float | None = None
     beta_kl: float = 1e-3
     kl_warmup_epochs: int = 0  # linearly anneal beta_kl from 0 to beta_kl over this many epochs
+    class_weights: tuple[float, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -542,7 +544,7 @@ class ConvGNPBaseline(nn.Module):
             meta_head = cfg.metadata_embed_dim
         cross_attn_dim = cfg.grid_feat_dim if cfg.use_latent else 0
         head_in = 2 * cfg.grid_feat_dim + cross_attn_dim + (1 if cfg.use_redshift else 0) + meta_head + 2 + 2 * latent_dim  # mean+max+attended; +2: t_span_log, n_obs_log; +2*latent_dim: mu+logvar
-        self.classifier = MLP(head_in, cfg.classifier_hidden_dim, 1, depth=3, dropout=0.1)
+        self.classifier = MLP(head_in, cfg.classifier_hidden_dim, cfg.num_classes, depth=3, dropout=0.1)
         self.register_buffer("grid_x", torch.linspace(cfg.grid_min, cfg.grid_max, cfg.grid_size))
 
     def _encode_points(self, batch: BaselineBatch) -> torch.Tensor:
@@ -615,7 +617,9 @@ class ConvGNPBaseline(nn.Module):
             pooled.extend([latent_mu, latent_logvar])
         if self.meta_encoder is not None:
             pooled.append(self.meta_encoder(torch.cat([batch.meta_values, batch.meta_mask], dim=-1)))
-        class_logits = self.classifier(torch.cat(pooled, dim=-1)).squeeze(-1)
+        class_logits = self.classifier(torch.cat(pooled, dim=-1))
+        if self.cfg.num_classes == 1:
+            class_logits = class_logits.squeeze(-1)
         return ConvGNPBaselineOutput(pred_mean=pred_mean, pred_var=pred_var, class_logits=class_logits, grid_features=grid_features, latent_mu=latent_mu, latent_logvar=latent_logvar)
 
 
@@ -625,8 +629,16 @@ def baseline_loss(output: ConvGNPBaselineOutput, batch: BaselineBatch, cfg: Base
     sq = (batch.target_y - output.pred_mean).square()
     recon_terms = 0.5 * (sq / var + torch.log(var))
     recon = (recon_terms * mask).sum() / mask.sum().clamp_min(1.0)
-    pos_weight = None if cfg.pos_weight is None else torch.tensor(cfg.pos_weight, device=batch.labels.device)
-    cls = F.binary_cross_entropy_with_logits(output.class_logits, batch.labels, pos_weight=pos_weight)
+    is_binary = output.class_logits.dim() == 1 or output.class_logits.shape[-1] == 1
+    if is_binary:
+        logits_1d = output.class_logits.squeeze(-1) if output.class_logits.dim() > 1 else output.class_logits
+        pos_weight = None if cfg.pos_weight is None else torch.tensor(cfg.pos_weight, device=batch.labels.device)
+        cls = F.binary_cross_entropy_with_logits(logits_1d, batch.labels, pos_weight=pos_weight)
+    else:
+        weight = None
+        if cfg.class_weights is not None:
+            weight = torch.tensor(cfg.class_weights, dtype=torch.float32, device=batch.labels.device)
+        cls = F.cross_entropy(output.class_logits, batch.labels.long(), weight=weight)
     kl: torch.Tensor | None = None
     total = cfg.lambda_recon * recon + cfg.lambda_cls * cls
     if output.latent_mu is not None and output.latent_logvar is not None:
@@ -666,6 +678,26 @@ def evaluate_binary_predictions(logits: torch.Tensor, labels: torch.Tensor) -> d
     return metrics
 
 
+def evaluate_multiclass_predictions(logits: torch.Tensor, labels: torch.Tensor) -> dict[str, float]:
+    probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+    y = labels.detach().cpu().numpy().astype(int)
+    preds = probs.argmax(axis=-1)
+    metrics: dict[str, float] = {
+        "macro_f1": float(f1_score(y, preds, average="macro", zero_division=0)),
+        "weighted_f1": float(f1_score(y, preds, average="weighted", zero_division=0)),
+    }
+    try:
+        metrics["macro_auroc"] = float(roc_auc_score(y, probs, multi_class="ovr", average="macro"))
+    except Exception:
+        metrics["macro_auroc"] = float("nan")
+    try:
+        from sklearn.metrics import top_k_accuracy_score
+        metrics["top1_acc"] = float(top_k_accuracy_score(y, probs, k=1))
+    except Exception:
+        metrics["top1_acc"] = float((preds == y).mean())
+    return metrics
+
+
 def fit_epoch(model: ConvGNPBaseline, loader, optimizer, loss_cfg: BaselineLossConfig, device: str | torch.device) -> dict[str, float]:
     model.train()
     rows: list[dict[str, float]] = []
@@ -701,7 +733,12 @@ def evaluate_epoch(model: ConvGNPBaseline, loader, loss_cfg: BaselineLossConfig,
         labels.append(batch.labels.detach().cpu())
     metrics = {k: float(np.mean([row[k] for row in loss_rows])) for k in loss_rows[0]} if loss_rows else {}
     if logits:
-        metrics.update(evaluate_binary_predictions(torch.cat(logits), torch.cat(labels)))
+        all_logits = torch.cat(logits)
+        all_labels = torch.cat(labels)
+        if all_logits.dim() == 1 or all_logits.shape[-1] == 1:
+            metrics.update(evaluate_binary_predictions(all_logits, all_labels))
+        else:
+            metrics.update(evaluate_multiclass_predictions(all_logits, all_labels))
     return metrics
 
 
@@ -721,14 +758,28 @@ def collect_epoch_predictions(model: ConvGNPBaseline, loader, loss_cfg: Baseline
         loss_rows.append(ep_row)
         batch_logits = output.class_logits.detach().cpu()
         batch_labels = batch.labels.detach().cpu()
-        batch_probs = torch.sigmoid(batch_logits).numpy()
         logits.append(batch_logits)
         labels.append(batch_labels)
-        for oid, label, prob in zip(batch.object_ids, batch_labels.numpy().astype(int), batch_probs):
-            rows.append({"object_id": str(oid), "target": int(label), "prob_tde": float(prob)})
+        is_binary = batch_logits.dim() == 1 or batch_logits.shape[-1] == 1
+        if is_binary:
+            batch_probs = torch.sigmoid(batch_logits.squeeze(-1) if batch_logits.dim() > 1 else batch_logits).numpy()
+            for oid, label, prob in zip(batch.object_ids, batch_labels.numpy().astype(int), batch_probs):
+                rows.append({"object_id": str(oid), "target": int(label), "prob_tde": float(prob)})
+        else:
+            batch_probs = torch.softmax(batch_logits, dim=-1).numpy()
+            for oid, label, probs_row in zip(batch.object_ids, batch_labels.numpy().astype(int), batch_probs):
+                row: dict[str, float | str | int] = {"object_id": str(oid), "target": int(label)}
+                for k, p in enumerate(probs_row):
+                    row[f"prob_class_{k}"] = float(p)
+                rows.append(row)
     metrics = {k: float(np.mean([row[k] for row in loss_rows])) for k in loss_rows[0]} if loss_rows else {}
     if logits:
-        metrics.update(evaluate_binary_predictions(torch.cat(logits), torch.cat(labels)))
+        all_logits = torch.cat(logits)
+        all_labels = torch.cat(labels)
+        if all_logits.dim() == 1 or all_logits.shape[-1] == 1:
+            metrics.update(evaluate_binary_predictions(all_logits, all_labels))
+        else:
+            metrics.update(evaluate_multiclass_predictions(all_logits, all_labels))
     return metrics, rows
 
 
@@ -757,14 +808,28 @@ def collect_full_context_predictions(
         output = model(batch)
         batch_logits = output.class_logits.detach().cpu()
         batch_labels = batch.labels.detach().cpu()
-        batch_probs = torch.sigmoid(batch_logits).numpy()
         logits.append(batch_logits)
         labels.append(batch_labels)
-        for oid, label, prob in zip(batch.object_ids, batch_labels.numpy().astype(int), batch_probs):
-            rows.append({"object_id": str(oid), "target": int(label), "prob_tde": float(prob)})
+        is_binary = batch_logits.dim() == 1 or batch_logits.shape[-1] == 1
+        if is_binary:
+            batch_probs = torch.sigmoid(batch_logits.squeeze(-1) if batch_logits.dim() > 1 else batch_logits).numpy()
+            for oid, label, prob in zip(batch.object_ids, batch_labels.numpy().astype(int), batch_probs):
+                rows.append({"object_id": str(oid), "target": int(label), "prob_tde": float(prob)})
+        else:
+            batch_probs = torch.softmax(batch_logits, dim=-1).numpy()
+            for oid, label, probs_row in zip(batch.object_ids, batch_labels.numpy().astype(int), batch_probs):
+                row: dict[str, float | str | int] = {"object_id": str(oid), "target": int(label)}
+                for k, p in enumerate(probs_row):
+                    row[f"prob_class_{k}"] = float(p)
+                rows.append(row)
     metrics: dict[str, float] = {}
     if logits:
-        metrics.update(evaluate_binary_predictions(torch.cat(logits), torch.cat(labels)))
+        all_logits = torch.cat(logits)
+        all_labels = torch.cat(labels)
+        if all_logits.dim() == 1 or all_logits.shape[-1] == 1:
+            metrics.update(evaluate_binary_predictions(all_logits, all_labels))
+        else:
+            metrics.update(evaluate_multiclass_predictions(all_logits, all_labels))
     return metrics, rows
 
 

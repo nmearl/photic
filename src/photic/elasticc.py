@@ -29,9 +29,36 @@ FOCUS_RELEASES = [
     "ELASTICC_TRAIN_SNIIb+HostXT_V19",
 ]
 
+# Physical class taxonomy: template/model variants collapsed into 7 groups
+CLASS_NAMES: list[str] = ["TDE", "AGN", "SLSN", "PISN", "SN-Ia", "SN-II", "SN-Ibc"]
+NUM_ELASTICC_CLASSES: int = len(CLASS_NAMES)
+
+RELEASE_TO_CLASS: dict[str, int] = {
+    "ELASTICC_TRAIN_TDE": 0,
+    "ELASTICC_TRAIN_AGN": 1,
+    "ELASTICC_TRAIN_SLSN-I+host": 2,
+    "ELASTICC_TRAIN_SLSN-I_no_host": 2,
+    "ELASTICC_TRAIN_PISN": 3,
+    "ELASTICC_TRAIN_SNIa-SALT2": 4,
+    "ELASTICC_TRAIN_SNIa-91bg": 4,
+    "ELASTICC_TRAIN_SNIax": 4,
+    "ELASTICC_TRAIN_SNII+HostXT_V19": 5,
+    "ELASTICC_TRAIN_SNII-NMF": 5,
+    "ELASTICC_TRAIN_SNII-Templates": 5,
+    "ELASTICC_TRAIN_SNIIn+HostXT_V19": 5,
+    "ELASTICC_TRAIN_SNIIn-MOSFIT": 5,
+    "ELASTICC_TRAIN_SNIIb+HostXT_V19": 6,
+    "ELASTICC_TRAIN_SNIb+HostXT_V19": 6,
+    "ELASTICC_TRAIN_SNIb-Templates": 6,
+    "ELASTICC_TRAIN_SNIc+HostXT_V19": 6,
+    "ELASTICC_TRAIN_SNIc-Templates": 6,
+    "ELASTICC_TRAIN_SNIcBL+HostXT_V19": 6,
+}
+
 META_FIELDS = [
     "MWEBV",
     "REDSHIFT_FINAL",
+    "HOSTGAL_PHOTOZ",
     "HOSTGAL_SNSEP",
     "HOSTGAL_DDLR",
     "HOSTGAL_LOGMASS",
@@ -100,7 +127,7 @@ def load_elasticc_focus_records(
         if max_shards_per_release is not None:
             head_paths = head_paths[:max_shards_per_release]
         release_count = 0
-        target = 1 if release_name == "ELASTICC_TRAIN_TDE" else 0
+        target = RELEASE_TO_CLASS.get(release_name, -1)
 
         for head_path in head_paths:
             phot_path = Path(str(head_path).replace("_HEAD.FITS.gz", "_PHOT.FITS.gz"))

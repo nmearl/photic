@@ -9,6 +9,7 @@ from .baseline import (
     MallornBaselineDataset,
     collate_baseline_batch,
     evaluate_binary_predictions,
+    evaluate_multiclass_predictions,
     evaluate_epoch,
     fit_epoch,
     load_baseline_checkpoint,
@@ -17,6 +18,7 @@ from .baseline import (
     save_baseline_checkpoint,
 )
 from .data import BANDS, BAND2IDX, EBV_COEFFS, apply_ebv_correction, load_all_data, preprocess_mallorn_training_tables
+from .elasticc import CLASS_NAMES, NUM_ELASTICC_CLASSES, RELEASE_TO_CLASS
 
 __all__ = [
     "BANDS",
@@ -25,6 +27,9 @@ __all__ = [
     "apply_ebv_correction",
     "load_all_data",
     "preprocess_mallorn_training_tables",
+    "CLASS_NAMES",
+    "NUM_ELASTICC_CLASSES",
+    "RELEASE_TO_CLASS",
     "BaselineBatch",
     "BaselineCollateConfig",
     "BaselineLossConfig",
@@ -35,6 +40,7 @@ __all__ = [
     "MallornBaselineDataset",
     "collate_baseline_batch",
     "evaluate_binary_predictions",
+    "evaluate_multiclass_predictions",
     "evaluate_epoch",
     "fit_epoch",
     "load_baseline_checkpoint",
